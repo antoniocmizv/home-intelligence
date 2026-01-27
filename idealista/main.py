@@ -12,6 +12,13 @@ TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DB_PATH = "/app/data/pisos.db"
 
+# Lista de agentes de usuario para rotar y parecer diferentes personas
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
+]
+
 def init_db():
     print("📁 Verificando base de datos...", flush=True)
     conn = sqlite3.connect(DB_PATH)
@@ -20,7 +27,6 @@ def init_db():
                  (id TEXT PRIMARY KEY, titulo TEXT, precio REAL, link TEXT, fecha DATETIME)''')
     conn.commit()
     conn.close()
-    print("✅ Base de datos lista.", flush=True)
 
 def alerta(msg):
     try:
@@ -29,55 +35,65 @@ def alerta(msg):
     except Exception as e:
         print(f"❌ Error enviando Telegram: {e}", flush=True)
 
-def buscar_ruta_chrome():
-    # Intenta encontrar dónde está instalado Chrome en el Docker
-    rutas = ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/bin/google-chrome"]
-    for r in rutas:
-        if os.path.exists(r):
-            return r
-    return None
+def guardar_evidencia(driver, motivo):
+    """Guarda captura y HTML para depurar"""
+    print(f"📸 Guardando evidencia por: {motivo}...", flush=True)
+    try:
+        driver.save_screenshot(f"/app/data/debug_{motivo}.png")
+        with open(f"/app/data/debug_{motivo}.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        print("✅ Evidencia guardada en /app/data/", flush=True)
+    except Exception as e:
+        print(f"⚠️ No se pudo guardar evidencia: {e}", flush=True)
 
 def escanear():
     print("🏠 --- INICIANDO ESCANEO ---", flush=True)
-    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # CONFIGURACIÓN BLINDADA PARA DOCKER
-    print("⚙️ Configurando Chrome...", flush=True)
     options = uc.ChromeOptions()
-    options.add_argument('--headless=new') # Modo sin cabeza moderno
+    # No usamos headless=new a veces ayuda a pasar desapercibido si usamos xvfb (que ya instalamos)
+    # Pero en Docker puro suele ser necesario. Probamos configuración agresiva:
+    options.add_argument('--headless=new') 
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-setuid-sandbox')
-    options.add_argument('--disable-dev-shm-usage') # Vital para Docker
-    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--window-size=1920,1080')
-    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-
+    options.add_argument(f'--user-agent={random.choice(USER_AGENTS)}')
+    options.add_argument('--disable-blink-features=AutomationControlled') # Oculta que es un bot
+    
     driver = None
     try:
-        binario_chrome = buscar_ruta_chrome()
-        if binario_chrome:
-            options.binary_location = binario_chrome
-            
-        print(f"🚀 Lanzando navegador (Binario: {binario_chrome})...", flush=True)
-        # version_main=None fuerza a que UC detecte la versión automáticamente
-        driver = uc.Chrome(options=options, version_main=None) 
-        print("✅ Navegador arrancado correctamente.", flush=True)
+        driver = uc.Chrome(options=options, version_main=None)
         
+        # 1. Vamos a Google primero para coger cookies "buenas"
+        driver.get("https://www.google.com")
+        time.sleep(2)
+
+        # 2. Vamos a Idealista
         url = "https://www.idealista.com/alquiler-viviendas/granada-granada/"
         print(f"🌍 Navegando a: {url}", flush=True)
-        
         driver.get(url)
-        print("⏳ Esperando carga de página...", flush=True)
-        time.sleep(random.uniform(8, 12))
         
-        print("🔍 Analizando HTML...", flush=True)
+        print("⏳ Esperando carga...", flush=True)
+        time.sleep(random.uniform(10, 15))
+        
+        titulo = driver.title
+        print(f"📑 Título de la página: {titulo}", flush=True)
+
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        items = soup.find_all('article', class_='item')
         
+        # Si nos sale el Captcha de "Just a moment..." o Access Denied
+        if "idealista" not in titulo.lower() and "alquiler" not in titulo.lower():
+             print("⚠️ ALERTA: Posible bloqueo detectado por el título.", flush=True)
+             guardar_evidencia(driver, "bloqueo_titulo")
+
+        items = soup.find_all('article', class_='item')
         print(f"📊 Encontrados {len(items)} anuncios potenciales.", flush=True)
 
+        if len(items) == 0:
+            guardar_evidencia(driver, "cero_items")
+        
         nuevos = 0
         for item in items:
             try:
@@ -86,43 +102,41 @@ def escanear():
                 if not link_tag or not price_tag: continue
                 
                 link = "https://www.idealista.com" + link_tag['href']
-                # Intentar sacar ID del link o generar uno hash
                 try:
                     pid = re.search(r'/(\d+)/', link).group(1)
                 except:
                     pid = str(hash(link))
                     
                 precio = float(price_tag.text.replace('.', '').replace('€', '').strip())
-                titulo = link_tag.text.strip()
+                titulo_piso = link_tag.text.strip()
 
                 c.execute("SELECT precio FROM pisos WHERE id=?", (pid,))
                 row = c.fetchone()
 
                 if not row:
-                    c.execute("INSERT INTO pisos VALUES (?, ?, ?, ?, datetime('now'))", (pid, titulo, precio, link))
-                    alerta(f"🆕 <b>NUEVO: {precio}€</b>\n{titulo}\n<a href='{link}'>Ver</a>")
+                    c.execute("INSERT INTO pisos VALUES (?, ?, ?, ?, datetime('now'))", (pid, titulo_piso, precio, link))
+                    alerta(f"🆕 <b>NUEVO: {precio}€</b>\n{titulo_piso}\n<a href='{link}'>Ver</a>")
                     nuevos += 1
                 elif precio < row[0]:
                     c.execute("UPDATE pisos SET precio=? WHERE id=?", (precio, pid))
-                    alerta(f"📉 <b>BAJADA: {precio}€</b> (Antes {row[0]}€)\n{titulo}\n<a href='{link}'>Ver</a>")
+                    alerta(f"📉 <b>BAJADA: {precio}€</b> (Antes {row[0]}€)\n{titulo_piso}\n<a href='{link}'>Ver</a>")
                     nuevos += 1
-            except Exception as e:
-                print(f"⚠️ Error procesando un anuncio: {e}", flush=True)
+            except:
                 continue
                 
         conn.commit()
-        print(f"🏁 Escaneo terminado. Novedades enviadas: {nuevos}", flush=True)
+        print(f"🏁 Escaneo terminado. Enviados: {nuevos}", flush=True)
 
     except Exception as e:
-        print(f"❌ ERROR FATAL EN CHROME: {e}", flush=True)
-        # Si falla, borramos la carpeta de sesión por si se corrompió
+        print(f"❌ ERROR: {e}", flush=True)
+        if driver:
+            guardar_evidencia(driver, "error_crash")
         try:
             shutil.rmtree(driver.user_data_dir, ignore_errors=True)
         except:
             pass
     finally:
         if driver:
-            print("🛑 Cerrando navegador...", flush=True)
             driver.quit()
         conn.close()
 
