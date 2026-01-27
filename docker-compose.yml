@@ -7,9 +7,10 @@ services:
     container_name: intel_vuelos
     restart: unless-stopped
     environment:
-      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+     - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - KIWI_API_KEY=${KIWI_API_KEY}
+      - AMADEUS_CLIENT_ID=${AMADEUS_CLIENT_ID}     
+      - AMADEUS_CLIENT_SECRET=${AMADEUS_CLIENT_SECRET}
       - TZ=${TZ}
 
   # --- RASTREADOR DE IDEALISTA ---
@@ -21,8 +22,6 @@ services:
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - AMADEUS_CLIENT_ID=${AMADEUS_CLIENT_ID}     
-      - AMADEUS_CLIENT_SECRET=${AMADEUS_CLIENT_SECRET} 
       - TZ=${TZ}
     volumes:
       - ./idealista/data:/app/data
