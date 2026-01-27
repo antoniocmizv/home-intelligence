@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.db
+*.log
+idealista/data/*
+!idealista/data/.gitkeep

@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  # --- RASTREADOR DE VUELOS ---
+  bot_vuelos:
+    build: ./vuelos
+    container_name: intel_vuelos
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - KIWI_API_KEY=${KIWI_API_KEY}
+      - TZ=${TZ}
+
+  # --- RASTREADOR DE IDEALISTA ---
+  bot_idealista:
+    build: ./idealista
+    container_name: intel_idealista
+    shm_size: '2gb' # Necesario para Chrome
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - AMADEUS_CLIENT_ID=${AMADEUS_CLIENT_ID}     
+      - AMADEUS_CLIENT_SECRET=${AMADEUS_CLIENT_SECRET} 
+      - TZ=${TZ}
+    volumes:
+      - ./idealista/data:/app/data
+
+  # --- VISUALIZACIÓN DE DATOS (METABASE) ---
+  metabase:
+    image: metabase/metabase:latest
+    container_name: intel_dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./idealista/data:/app/data
+    environment:
+      - MB_DB_FILE=/metabase-data/metabase.db
