@@ -3,7 +3,6 @@ import base64
 import sqlite3
 import time
 import os
-import sys
 from datetime import datetime
 
 # --- CONFIGURACIÓN ---
@@ -13,15 +12,12 @@ TOKEN_TELEGRAM = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DB_PATH = "/app/data/pisos.db"
 
-# Ubicación y Radio
+# Ubicación y Radio (Granada)
 LAT = 37.1729
 LNG = -3.5995
 DISTANCIA = 6000  # 6 km a la redonda
 
-# --- ESTRATEGIA DE CONSUMO DE API ---
-# Si maxItems=50, cada página gasta 1 petición.
-# Tienes 100 al mes. 
-# Recomendación: MAX_PAGINAS_DIA = 3 (150 pisos/día) o desactivar límite si es ejecución única.
+# Límite de seguridad
 MAX_PAGINAS_DIA = 5 
 
 def init_db():
@@ -59,83 +55,86 @@ def obtener_token():
     url = "https://api.idealista.com/oauth/token"
     credenciales = f"{API_KEY}:{API_SECRET}"
     auth_b64 = base64.b64encode(credenciales.encode()).decode()
-    headers = {"Authorization": f"Basic {auth_b64}", "Content-Type": "application/x-www-form-urlencoded"}
+    
+    # OAuth usa formato formulario siempre
+    headers = {
+        "Authorization": f"Basic {auth_b64}", 
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
     
     try:
         r = requests.post(url, headers=headers, data={"grant_type": "client_credentials", "scope": "read"}, timeout=10)
         if r.status_code == 200:
             return r.json().get('access_token')
-        print(f"❌ Error Token: {r.text}", flush=True)
+        print(f"❌ Error Token ({r.status_code}): {r.text}", flush=True)
         return None
     except Exception as e:
-        print(f"❌ Error Conexión: {e}", flush=True)
+        print(f"❌ Error Conexión Auth: {e}", flush=True)
         return None
 
 def buscar_pisos():
-    print("🚀 --- INICIANDO BÚSQUEDA MASIVA ---", flush=True) 
+    print("🚀 --- INICIANDO BÚSQUEDA ---", flush=True)
     token = obtener_token()
     if not token: return
 
+    # OJO: La URL lleva el país en la ruta
     url = "https://api.idealista.com/3.5/es/search"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
-    # Bucle de paginación
+    # CORRECCIÓN IMPORTANTE: Quitamos 'Content-Type: application/json'
+    # Requests pondrá automáticamente 'application/x-www-form-urlencoded'
+    headers = {"Authorization": f"Bearer {token}"}
+    
     num_pagina = 1
     total_pisos_procesados = 0
     
     while num_pagina <= MAX_PAGINAS_DIA:
         print(f"📄 Solicitando página {num_pagina}...", flush=True)
         
-        # PARÁMETROS SEGÚN TU DOCUMENTACIÓN
         params = {
-            "country": "es",
-            "operation": "rent",
-            "propertyType": "homes",
-            "center": f"{LAT},{LNG}",
-            "distance": DISTANCIA,
-            "sort": "date",
-            "maxItems": 50,         # Máximo permitido por la API 
-            "numPage": num_pagina,  # Paginación [cite: 22]
+            "country": "es",            # Obligatorio [cite: 21]
+            "operation": "rent",        # Obligatorio [cite: 21]
+            "propertyType": "homes",    # Obligatorio [cite: 21]
+            "center": f"{LAT},{LNG}",   # Coordenadas [cite: 21]
+            "distance": DISTANCIA,      # Radio en metros [cite: 21]
+            "order": "publicationDate", # Ordenar por fecha (más nuevos primero) 
+            "sort": "desc",             # Descendente 
+            "maxItems": 50,             # Máximo permitido [cite: 21]
+            "numPage": num_pagina,      # Paginación 
             
-            # FILTROS PERSONALIZADOS 
-            # Habitaciones: "2,3,4" incluye 2, 3 y "4 o más". Esto maximiza resultados.
-            "bedrooms": "2,3,4",
-            
-            # Baños: "1,2,3" incluye 1, 2 y "3 o más" (Excluye 0).
-            "bathrooms": "1,2,3",
-            
-            # Opcional: Usar 'sinceDate'='W' (semana) o 'M' (mes) si quieres limitar antigüedad
-            # "sinceDate": "M" 
+            # FILTROS
+            "bedrooms": "2,3,4",        # 2, 3 y 4+ habitaciones [cite: 73]
+            "bathrooms": "1,2,3",       # 1, 2 y 3+ baños [cite: 73]
+            "hasMultimedia": "true"     # Solo pisos con fotos 
         }
 
         try:
+            # data=params envía formato formulario (Correcto)
             r = requests.post(url, headers=headers, data=params, timeout=10)
+            
             if r.status_code != 200:
-                print(f"❌ Error API: {r.text}", flush=True)
+                print(f"❌ Error API ({r.status_code}): {r.text}", flush=True)
                 break
 
             data = r.json()
             pisos = data.get('elementList', [])
             total_disponible = data.get('total', 0)
-            total_paginas = data.get('totalPages', 1) # [cite: 111]
+            total_paginas = data.get('totalPages', 1)
             
-            print(f"📊 Página {num_pagina}/{total_paginas}. Recibidos: {len(pisos)} pisos (Total mercado: {total_disponible})", flush=True)
+            print(f"📊 Recibidos: {len(pisos)} pisos (Total mercado: {total_disponible})", flush=True)
             
             if not pisos:
-                print("🏁 No hay más pisos en esta página.", flush=True)
+                print("🏁 No hay más pisos.", flush=True)
                 break
 
-            # Procesar pisos
             procesar_lote(pisos)
             total_pisos_procesados += len(pisos)
 
-            # Control de paginación
             if num_pagina >= total_paginas:
-                print("✅ Se han descargado TODAS las páginas disponibles.", flush=True)
+                print("✅ Fin de resultados disponibles.", flush=True)
                 break
             
             num_pagina += 1
-            time.sleep(2) # Pequeña pausa de cortesía
+            time.sleep(1.5)
 
         except Exception as e:
             print(f"❌ Error en bucle: {e}", flush=True)
@@ -155,10 +154,9 @@ def procesar_lote(pisos):
             precio = p.get('price')
             metros = p.get('size')
             habitaciones = p.get('rooms')
-            planta = p.get('floor', 'Bajo/Sin datos')
+            planta = p.get('floor', 'Bajo')
             link = p.get('url')
             
-            # Verificar existencia
             c.execute("SELECT precio FROM pisos WHERE id=?", (pid,))
             row = c.fetchone()
             
@@ -182,17 +180,16 @@ def procesar_lote(pisos):
                 msg = (f"📉 <b>BAJADA (-{diff}€)</b>\nAntes: {row[0]}€ ➡️ {precio}€\n<a href='{link}'>🔗 Ver piso</a>")
                 enviar_telegram(msg)
         
-        except Exception as e:
+        except Exception:
             continue
 
     conn.commit()
     conn.close()
-    if nuevos > 0: print(f"✨ {nuevos} pisos nuevos guardados en este lote.", flush=True)
+    if nuevos > 0: print(f"✨ {nuevos} pisos nuevos guardados.", flush=True)
 
 if __name__ == "__main__":
     init_db()
     while True:
         buscar_pisos()
-        # Cada 24 horas para no gastar paginación excesiva
         print("💤 Durmiendo 24 horas...", flush=True)
         time.sleep(86400)
