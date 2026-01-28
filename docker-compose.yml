@@ -12,8 +12,7 @@ services:
       - AMADEUS_CLIENT_ID=${AMADEUS_CLIENT_ID}     
       - AMADEUS_CLIENT_SECRET=${AMADEUS_CLIENT_SECRET}
       - TZ=${TZ}
-      -IDEALISTA_API_KEY=${IDEALISTA_API_KEY}
-      -IDEALISTA_SECRET=${IDEALISTA_SECRET}
+      
 
 
   # --- RASTREADOR DE IDEALISTA ---
@@ -26,6 +25,8 @@ services:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - TZ=${TZ}
+      - IDEALISTA_API_KEY=${IDEALISTA_API_KEY}
+      - IDEALISTA_SECRET=${IDEALISTA_SECRET}
     volumes:
       - ./idealista/data:/app/data
 
