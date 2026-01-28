@@ -3,6 +3,7 @@ import base64
 import sqlite3
 import time
 import os
+import sys
 from datetime import datetime
 
 # --- CONFIGURACIÓN ---
@@ -12,12 +13,12 @@ TOKEN_TELEGRAM = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DB_PATH = "/app/data/pisos.db"
 
-# Ubicación y Radio (Granada)
+# Ubicación y Radio
 LAT = 37.1729
 LNG = -3.5995
 DISTANCIA = 6000  # 6 km a la redonda
 
-# Límite de seguridad
+# Estrategia de consumo
 MAX_PAGINAS_DIA = 5 
 
 def init_db():
@@ -53,10 +54,11 @@ def enviar_telegram(msg):
 
 def obtener_token():
     url = "https://api.idealista.com/oauth/token"
+    # Codificar credenciales en Base64
     credenciales = f"{API_KEY}:{API_SECRET}"
     auth_b64 = base64.b64encode(credenciales.encode()).decode()
     
-    # OAuth usa formato formulario siempre
+    # Headers correctos para OAuth
     headers = {
         "Authorization": f"Basic {auth_b64}", 
         "Content-Type": "application/x-www-form-urlencoded"
@@ -77,11 +79,9 @@ def buscar_pisos():
     token = obtener_token()
     if not token: return
 
-    # OJO: La URL lleva el país en la ruta
     url = "https://api.idealista.com/3.5/es/search"
     
-    # CORRECCIÓN IMPORTANTE: Quitamos 'Content-Type: application/json'
-    # Requests pondrá automáticamente 'application/x-www-form-urlencoded'
+    # Headers SIN Content-Type JSON (requests lo pone automático para form-data)
     headers = {"Authorization": f"Bearer {token}"}
     
     num_pagina = 1
@@ -90,25 +90,23 @@ def buscar_pisos():
     while num_pagina <= MAX_PAGINAS_DIA:
         print(f"📄 Solicitando página {num_pagina}...", flush=True)
         
+        # Parámetros corregidos y limpios
         params = {
-            "country": "es",            # Obligatorio [cite: 21]
-            "operation": "rent",        # Obligatorio [cite: 21]
-            "propertyType": "homes",    # Obligatorio [cite: 21]
-            "center": f"{LAT},{LNG}",   # Coordenadas [cite: 21]
-            "distance": DISTANCIA,      # Radio en metros [cite: 21]
-            "order": "publicationDate", # Ordenar por fecha (más nuevos primero) 
-            "sort": "desc",             # Descendente 
-            "maxItems": 50,             # Máximo permitido [cite: 21]
-            "numPage": num_pagina,      # Paginación 
-            
-            # FILTROS
-            "bedrooms": "2,3,4",        # 2, 3 y 4+ habitaciones [cite: 73]
-            "bathrooms": "1,2,3",       # 1, 2 y 3+ baños [cite: 73]
-            "hasMultimedia": "true"     # Solo pisos con fotos 
+            "country": "es",
+            "operation": "rent",
+            "propertyType": "homes",
+            "center": f"{LAT},{LNG}",
+            "distance": DISTANCIA,
+            "sort": "date",
+            "maxItems": 50,
+            "numPage": num_pagina,
+            "bedrooms": "2,3,4",    # 2, 3 y 4+ habitaciones
+            "bathrooms": "1,2,3",   # Mínimo 1 baño
+            "hasMultimedia": "true" # Solo con fotos
         }
 
         try:
-            # data=params envía formato formulario (Correcto)
+            # Usamos data=params para enviar como formulario
             r = requests.post(url, headers=headers, data=params, timeout=10)
             
             if r.status_code != 200:
@@ -157,14 +155,19 @@ def procesar_lote(pisos):
             planta = p.get('floor', 'Bajo')
             link = p.get('url')
             
+            # Cálculo de precio m2 si no viene
+            precio_m2 = p.get('priceByArea')
+            if not precio_m2 and metros and precio:
+                precio_m2 = round(precio / metros, 1)
+
             c.execute("SELECT precio FROM pisos WHERE id=?", (pid,))
             row = c.fetchone()
             
             if not row:
                 c.execute("""INSERT INTO pisos 
-                             (id, titulo, precio, metros, habitaciones, planta, link, fecha_registro, fecha_actualizacion) 
-                             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
-                          (pid, titulo, precio, metros, habitaciones, planta, link))
+                             (id, titulo, precio, precio_m2, metros, habitaciones, planta, link, fecha_registro, fecha_actualizacion) 
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+                          (pid, titulo, precio, precio_m2, metros, habitaciones, planta, link))
                 c.execute("INSERT INTO historial_precios VALUES (?, ?, datetime('now'))", (pid, precio))
                 
                 msg = (f"🆕 <b>NOVEDAD ({precio}€)</b>\n"
@@ -177,6 +180,8 @@ def procesar_lote(pisos):
             elif precio < row[0]:
                 diff = row[0] - precio
                 c.execute("UPDATE pisos SET precio=?, fecha_actualizacion=datetime('now') WHERE id=?", (precio, pid))
+                c.execute("INSERT INTO historial_precios VALUES (?, ?, datetime('now'))", (pid, precio))
+                
                 msg = (f"📉 <b>BAJADA (-{diff}€)</b>\nAntes: {row[0]}€ ➡️ {precio}€\n<a href='{link}'>🔗 Ver piso</a>")
                 enviar_telegram(msg)
         
