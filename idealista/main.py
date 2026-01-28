@@ -97,7 +97,7 @@ def buscar_pisos():
             "propertyType": "homes",
             "center": f"{LAT},{LNG}",
             "distance": DISTANCIA,
-            "sort": "date",
+            "sort": "asc",
             "maxItems": 50,
             "numPage": num_pagina,
             "bedrooms": "2,3,4",    # 2, 3 y 4+ habitaciones
