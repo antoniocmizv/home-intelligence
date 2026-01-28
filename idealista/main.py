@@ -12,7 +12,7 @@ API_SECRET = os.getenv('IDEALISTA_SECRET')
 TOKEN_TELEGRAM = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DB_PATH = "/app/data/pisos.db"
-print(f"🔍 DEBUG CLAVES: Key='{API_KEY[:5]}...' | Secret='{API_SECRET[:5]}...'", flush=True)
+
 # Ubicación y Radio
 LAT = 37.1729
 LNG = -3.5995
@@ -73,6 +73,7 @@ def obtener_token():
 
 def buscar_pisos():
     print("🚀 --- INICIANDO BÚSQUEDA MASIVA ---", flush=True)
+    print(f"🔍 DEBUG CLAVES: Key='{API_KEY[:5]}...' | Secret='{API_SECRET[:5]}...'", flush=True)
     token = obtener_token()
     if not token: return
 
