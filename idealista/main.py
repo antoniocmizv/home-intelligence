@@ -72,8 +72,7 @@ def obtener_token():
         return None
 
 def buscar_pisos():
-    print("🚀 --- INICIANDO BÚSQUEDA MASIVA ---", flush=True)
-    print(f"🔍 DEBUG CLAVES: Key='{API_KEY[:5]}...' | Secret='{API_SECRET[:5]}...'", flush=True)
+    print("🚀 --- INICIANDO BÚSQUEDA MASIVA ---", flush=True) 
     token = obtener_token()
     if not token: return
 
@@ -193,6 +192,7 @@ def procesar_lote(pisos):
 if __name__ == "__main__":
     init_db()
     while True:
+        print(f"🔍 DEBUG CLAVES: Key='{API_KEY[:5]}...' | Secret='{API_SECRET[:5]}...'", flush=True)
         buscar_pisos()
         # Cada 24 horas para no gastar paginación excesiva
         print("💤 Durmiendo 24 horas...", flush=True)
