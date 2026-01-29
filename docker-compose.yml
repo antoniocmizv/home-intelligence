@@ -11,24 +11,38 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - AMADEUS_CLIENT_ID=${AMADEUS_CLIENT_ID}     
       - AMADEUS_CLIENT_SECRET=${AMADEUS_CLIENT_SECRET}
-      - TZ=${TZ}
-      
-
+      - TZ=${TZ:-Europe/Madrid}
+    labels:
+      - "monitoring=enabled"
 
   # --- RASTREADOR DE IDEALISTA ---
   bot_idealista:
     build: ./idealista
     container_name: intel_idealista
-    shm_size: '2gb' # Necesario para Chrome
     restart: unless-stopped
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - TZ=${TZ}
+      - TZ=${TZ:-Europe/Madrid}
       - IDEALISTA_API_KEY=${IDEALISTA_API_KEY}
       - IDEALISTA_SECRET=${IDEALISTA_SECRET}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_PAGES_PER_DAY=${MAX_PAGES_PER_DAY:-5}
+      - SEARCH_LAT=${SEARCH_LAT:-37.1729}
+      - SEARCH_LNG=${SEARCH_LNG:--3.5995}
+      - SEARCH_RADIUS=${SEARCH_RADIUS:-6000}
+      - ENABLE_BACKUPS=true
     volumes:
       - ./idealista/data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3; sqlite3.connect('/app/data/pisos.db').cursor().execute('SELECT 1')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "monitoring=enabled"
+      - "backup=enabled"
 
   # --- VISUALIZACIÓN DE DATOS (METABASE) ---
   metabase:
@@ -37,7 +51,36 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"
-    volumes:
-      - ./idealista/data:/app/data
     environment:
       - MB_DB_FILE=/metabase-data/metabase.db
+      - TZ=${TZ:-Europe/Madrid}
+    volumes:
+      - ./idealista/data:/app/data:ro
+      - ./metabase-data:/metabase-data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    labels:
+      - "monitoring=enabled"
+
+  # --- OPCIONAL: Prometheus para monitoreo ---
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: intel_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    labels:
+      - "monitoring=enabled"
+
+volumes:
+  metabase-data:
+  prometheus-data:

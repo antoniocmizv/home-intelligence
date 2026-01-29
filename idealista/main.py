@@ -1,200 +1,530 @@
+"""
+Bot de rastreo de pisos en Idealista
+Desplegado en Docker + SQLite + Metabase
+"""
 import requests
 import base64
 import sqlite3
 import time
-import os
-import sys
+import logging
+import shutil
 from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
+from functools import wraps
 
-# --- CONFIGURACIÓN ---
-API_KEY = os.getenv('IDEALISTA_API_KEY')
-API_SECRET = os.getenv('IDEALISTA_SECRET')
-TOKEN_TELEGRAM = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-DB_PATH = "/app/data/pisos.db"
+import config
+from utils import setup_logging, log_event
 
-# Ubicación y Radio
-LAT = 37.1729
-LNG = -3.5995
-DISTANCIA = 6000  # 6 km a la redonda
+# Configurar logging
+logger = setup_logging(
+    config.LOG_PATH,
+    level=config.LOG_LEVEL,
+    max_bytes=config.LOG_MAX_BYTES,
+    backup_count=config.LOG_BACKUP_COUNT
+)
 
-# Estrategia de consumo
-MAX_PAGINAS_DIA = 5 
+
+def retry_on_exception(max_retries: int = config.MAX_RETRIES, 
+                       delay: int = config.RETRY_DELAY):
+    """Decorador para reintentar funciones que fallen"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    logger.warning(
+                        f"Intento {attempt + 1}/{max_retries} falló en {func.__name__}: {e}. "
+                        f"Reintentando en {delay}s..."
+                    )
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+
 
 def init_db():
-    print("📁 Inicializando base de datos...", flush=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS pisos (
-        id TEXT PRIMARY KEY,
-        titulo TEXT,
-        precio REAL,
-        precio_m2 REAL,
-        metros INTEGER,
-        habitaciones INTEGER,
-        planta TEXT,
-        exterior BOOLEAN,
-        estado TEXT,
-        link TEXT,
-        fecha_registro DATETIME,
-        fecha_actualizacion DATETIME
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS historial_precios (
-        id_piso TEXT, precio REAL, fecha DATETIME
-    )''')
-    conn.commit()
-    conn.close()
-
-def enviar_telegram(msg):
+    """
+    Inicializa la base de datos SQLite con todas las tablas necesarias
+    """
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN_TELEGRAM}/sendMessage", 
-                      data={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=10)
+        logger.info("Inicializando base de datos...")
+        conn = sqlite3.connect(str(config.DB_PATH))
+        c = conn.cursor()
+        
+        # Tabla principal de pisos
+        c.execute('''CREATE TABLE IF NOT EXISTS pisos (
+            id TEXT PRIMARY KEY,
+            titulo TEXT NOT NULL,
+            precio REAL,
+            precio_m2 REAL,
+            metros INTEGER,
+            habitaciones INTEGER,
+            planta TEXT,
+            exterior BOOLEAN,
+            estado TEXT,
+            link TEXT NOT NULL,
+            fecha_registro DATETIME DEFAULT CURRENT_TIMESTAMP,
+            fecha_actualizacion DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # Tabla de historial de precios para análisis temporal
+        c.execute('''CREATE TABLE IF NOT EXISTS historial_precios (
+            id_piso TEXT,
+            precio REAL,
+            fecha DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (id_piso) REFERENCES pisos(id)
+        )''')
+        
+        # Crear índices para mejor performance
+        c.execute('CREATE INDEX IF NOT EXISTS idx_pisos_precio ON pisos(precio)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_pisos_fecha ON pisos(fecha_actualizacion)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_historial_piso ON historial_precios(id_piso)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_historial_fecha ON historial_precios(fecha)')
+        
+        # Tabla de estadísticas de ejecución (para monitoreo)
+        c.execute('''CREATE TABLE IF NOT EXISTS ejecuciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_inicio DATETIME DEFAULT CURRENT_TIMESTAMP,
+            fecha_fin DATETIME,
+            pisos_procesados INTEGER,
+            pisos_nuevos INTEGER,
+            pisos_modificados INTEGER,
+            errores INTEGER,
+            status TEXT
+        )''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("Base de datos inicializada correctamente")
+        
     except Exception as e:
-        print(f"❌ Error Telegram: {e}", flush=True)
+        logger.error(f"Error inicializando BD: {e}", exc_info=True)
+        raise
 
-def obtener_token():
-    url = "https://api.idealista.com/oauth/token"
-    # Codificar credenciales en Base64
-    credenciales = f"{API_KEY}:{API_SECRET}"
-    auth_b64 = base64.b64encode(credenciales.encode()).decode()
+@retry_on_exception(max_retries=config.MAX_RETRIES, delay=config.RETRY_DELAY)
+def enviar_telegram(msg: str, notification_type: str = 'info'):
+    """
+    Envía mensaje a Telegram con reintentos automáticos
     
-    # Headers correctos para OAuth
-    headers = {
-        "Authorization": f"Basic {auth_b64}", 
-        "Content-Type": "application/x-www-form-urlencoded"
+    Args:
+        msg: Mensaje a enviar
+        notification_type: Tipo de notificación (info, warning, error)
+    """
+    if not config.ENABLE_TELEGRAM:
+        logger.debug("Telegram deshabilitado, skip")
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': config.TELEGRAM_CHAT_ID,
+            'text': msg,
+            'parse_mode': 'HTML'
+        }
+        
+        response = requests.post(url, data=payload, timeout=config.TELEGRAM_TIMEOUT)
+        response.raise_for_status()
+        
+        log_event(logger, 'TELEGRAM_SENT', {
+            'notification_type': notification_type,
+            'length': len(msg)
+        })
+        
+    except Exception as e:
+        log_event(logger, 'TELEGRAM_ERROR', {
+            'error': str(e),
+            'message_preview': msg[:100]
+        }, level='error')
+
+@retry_on_exception(max_retries=config.MAX_RETRIES, delay=config.RETRY_DELAY)
+def obtener_token() -> Optional[str]:
+    """
+    Obtiene token OAuth de Idealista con reintentos automáticos
+    
+    Returns:
+        Token de acceso o None si falla
+    """
+    try:
+        # Codificar credenciales en Base64
+        credenciales = f"{config.IDEALISTA_API_KEY}:{config.IDEALISTA_SECRET}"
+        auth_b64 = base64.b64encode(credenciales.encode()).decode()
+        
+        headers = {
+            "Authorization": f"Basic {auth_b64}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        logger.debug("Solicitando token OAuth...")
+        response = requests.post(
+            config.IDEALISTA_TOKEN_URL,
+            headers=headers,
+            data={"grant_type": "client_credentials", "scope": "read"},
+            timeout=config.REQUEST_TIMEOUT
+        )
+        
+        if response.status_code == 200:
+            token = response.json().get('access_token')
+            logger.debug("Token obtenido correctamente")
+            return token
+        
+        logger.error(f"Error obteniendo token ({response.status_code}): {response.text}")
+        return None
+        
+    except Exception as e:
+        log_event(logger, 'TOKEN_ERROR', {'error': str(e)}, level='error')
+        raise
+
+def buscar_pisos() -> Dict:
+    """
+    Busca pisos en Idealista y procesa los resultados
+    
+    Returns:
+        Diccionario con estadísticas de la búsqueda
+    """
+    estadisticas = {
+        'total_procesados': 0,
+        'totales_nuevos': 0,
+        'totales_modificados': 0,
+        'errores': 0,
+        'status': 'success'
     }
     
     try:
-        r = requests.post(url, headers=headers, data={"grant_type": "client_credentials", "scope": "read"}, timeout=10)
-        if r.status_code == 200:
-            return r.json().get('access_token')
-        print(f"❌ Error Token ({r.status_code}): {r.text}", flush=True)
-        return None
+        logger.info("=== INICIANDO BÚSQUEDA DE PISOS ===")
+        
+        token = obtener_token()
+        if not token:
+            logger.error("No se pudo obtener token")
+            estadisticas['status'] = 'error'
+            return estadisticas
+        
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        for num_pagina in range(1, config.MAX_PAGES_PER_DAY + 1):
+            logger.info(f"Solicitando página {num_pagina}...")
+            
+            params = {
+                "country": "es",
+                "operation": "rent",
+                "propertyType": "homes",
+                "center": f"{config.SEARCH_LATITUDE},{config.SEARCH_LONGITUDE}",
+                "distance": config.SEARCH_RADIUS,
+                "sort": "asc",
+                "maxItems": config.ITEMS_PER_PAGE,
+                "numPage": num_pagina,
+                "bedrooms": ','.join(config.SEARCH_BEDROOMS),
+                "bathrooms": ','.join(config.SEARCH_BATHROOMS),
+                "hasMultimedia": "true"
+            }
+            
+            try:
+                response = requests.post(
+                    config.IDEALISTA_API_URL,
+                    headers=headers,
+                    data=params,
+                    timeout=config.REQUEST_TIMEOUT
+                )
+                
+                if response.status_code != 200:
+                    logger.error(f"Error API ({response.status_code}): {response.text}")
+                    estadisticas['errores'] += 1
+                    break
+                
+                data = response.json()
+                pisos = data.get('elementList', [])
+                total_disponible = data.get('total', 0)
+                total_paginas = data.get('totalPages', 1)
+                
+                logger.info(
+                    f"Página {num_pagina}: {len(pisos)} pisos recibidos "
+                    f"(Total mercado: {total_disponible})"
+                )
+                
+                if not pisos:
+                    logger.info("No hay más pisos disponibles")
+                    break
+                
+                nuevos, modificados = procesar_lote(pisos)
+                estadisticas['total_procesados'] += len(pisos)
+                estadisticas['totales_nuevos'] += nuevos
+                estadisticas['totales_modificados'] += modificados
+                
+                if num_pagina >= total_paginas:
+                    logger.info("Fin de resultados disponibles")
+                    break
+                
+                time.sleep(config.PAGE_WAIT_TIME)
+                
+            except Exception as e:
+                logger.error(f"Error procesando página {num_pagina}: {e}", exc_info=True)
+                estadisticas['errores'] += 1
+                break
+        
+        logger.info(
+            f"=== FIN DE BÚSQUEDA === "
+            f"Nuevos: {estadisticas['totales_nuevos']}, "
+            f"Modificados: {estadisticas['totales_modificados']}"
+        )
+        
     except Exception as e:
-        print(f"❌ Error Conexión Auth: {e}", flush=True)
-        return None
+        logger.error(f"Error crítico en búsqueda: {e}", exc_info=True)
+        estadisticas['status'] = 'error'
+    
+    return estadisticas
 
-def buscar_pisos():
-    print("🚀 --- INICIANDO BÚSQUEDA ---", flush=True)
-    token = obtener_token()
-    if not token: return
-
-    url = "https://api.idealista.com/3.5/es/search"
+def procesar_lote(pisos: List[Dict]) -> Tuple[int, int]:
+    """
+    Procesa un lote de pisos y los almacena en BD
     
-    # Headers SIN Content-Type JSON (requests lo pone automático para form-data)
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    num_pagina = 1
-    total_pisos_procesados = 0
-    
-    while num_pagina <= MAX_PAGINAS_DIA:
-        print(f"📄 Solicitando página {num_pagina}...", flush=True)
+    Args:
+        pisos: Lista de diccionarios con datos de pisos
         
-        # Parámetros corregidos y limpios
-        params = {
-            "country": "es",
-            "operation": "rent",
-            "propertyType": "homes",
-            "center": f"{LAT},{LNG}",
-            "distance": DISTANCIA,
-            "sort": "asc",
-            "maxItems": 50,
-            "numPage": num_pagina,
-            "bedrooms": "2,3,4",    # 2, 3 y 4+ habitaciones
-            "bathrooms": "1,2,3",   # Mínimo 1 baño
-            "hasMultimedia": "true" # Solo con fotos
-        }
-
-        try:
-            # Usamos data=params para enviar como formulario
-            r = requests.post(url, headers=headers, data=params, timeout=10)
-            
-            if r.status_code != 200:
-                print(f"❌ Error API ({r.status_code}): {r.text}", flush=True)
-                break
-
-            data = r.json()
-            pisos = data.get('elementList', [])
-            total_disponible = data.get('total', 0)
-            total_paginas = data.get('totalPages', 1)
-            
-            print(f"📊 Recibidos: {len(pisos)} pisos (Total mercado: {total_disponible})", flush=True)
-            
-            if not pisos:
-                print("🏁 No hay más pisos.", flush=True)
-                break
-
-            procesar_lote(pisos)
-            total_pisos_procesados += len(pisos)
-
-            if num_pagina >= total_paginas:
-                print("✅ Fin de resultados disponibles.", flush=True)
-                break
-            
-            num_pagina += 1
-            time.sleep(1.5)
-
-        except Exception as e:
-            print(f"❌ Error en bucle: {e}", flush=True)
-            break
-    
-    print(f"💤 Fin del ciclo. Total procesados hoy: {total_pisos_procesados}", flush=True)
-
-def procesar_lote(pisos):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    Returns:
+        Tupla (pisos_nuevos, pisos_modificados)
+    """
     nuevos = 0
+    modificados = 0
     
-    for p in pisos:
-        try:
-            pid = str(p.get('propertyCode'))
-            titulo = p.get('suggestedTexts', {}).get('title', 'Piso en Granada')
-            precio = p.get('price')
-            metros = p.get('size')
-            habitaciones = p.get('rooms')
-            planta = p.get('floor', 'Bajo')
-            link = p.get('url')
-            
-            # Cálculo de precio m2 si no viene
-            precio_m2 = p.get('priceByArea')
-            if not precio_m2 and metros and precio:
-                precio_m2 = round(precio / metros, 1)
-
-            c.execute("SELECT precio FROM pisos WHERE id=?", (pid,))
-            row = c.fetchone()
-            
-            if not row:
-                c.execute("""INSERT INTO pisos 
-                             (id, titulo, precio, precio_m2, metros, habitaciones, planta, link, fecha_registro, fecha_actualizacion) 
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
-                          (pid, titulo, precio, precio_m2, metros, habitaciones, planta, link))
-                c.execute("INSERT INTO historial_precios VALUES (?, ?, datetime('now'))", (pid, precio))
-                
-                msg = (f"🆕 <b>NOVEDAD ({precio}€)</b>\n"
-                       f"🏠 {titulo}\n"
-                       f"🛏️ {habitaciones} hab | 📏 {metros}m²\n"
-                       f"<a href='{link}'>🔗 Ver en Idealista</a>")
-                enviar_telegram(msg)
-                nuevos += 1
-                
-            elif precio < row[0]:
-                diff = row[0] - precio
-                c.execute("UPDATE pisos SET precio=?, fecha_actualizacion=datetime('now') WHERE id=?", (precio, pid))
-                c.execute("INSERT INTO historial_precios VALUES (?, ?, datetime('now'))", (pid, precio))
-                
-                msg = (f"📉 <b>BAJADA (-{diff}€)</b>\nAntes: {row[0]}€ ➡️ {precio}€\n<a href='{link}'>🔗 Ver piso</a>")
-                enviar_telegram(msg)
+    try:
+        conn = sqlite3.connect(str(config.DB_PATH))
+        c = conn.cursor()
         
-        except Exception:
-            continue
+        for p in pisos:
+            try:
+                pid = str(p.get('propertyCode'))
+                titulo = p.get('suggestedTexts', {}).get('title', 'Sin título')
+                precio = p.get('price')
+                metros = p.get('size')
+                habitaciones = p.get('rooms')
+                planta = p.get('floor', 'Bajo')
+                exterior = p.get('exterior', False)
+                link = p.get('url', '')
+                
+                # Cálculo de precio m2
+                precio_m2 = p.get('priceByArea')
+                if not precio_m2 and metros and precio:
+                    precio_m2 = round(precio / metros, 1)
+                
+                c.execute("SELECT precio FROM pisos WHERE id=?", (pid,))
+                row = c.fetchone()
+                
+                if not row:
+                    # NUEVO PISO
+                    c.execute("""INSERT INTO pisos 
+                                 (id, titulo, precio, precio_m2, metros, habitaciones, 
+                                  planta, exterior, link, fecha_registro, fecha_actualizacion) 
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+                              (pid, titulo, precio, precio_m2, metros, habitaciones, planta, exterior, link))
+                    c.execute("INSERT INTO historial_precios VALUES (?, ?, datetime('now'))", (pid, precio))
+                    
+                    msg = (
+                        f"🆕 <b>NOVEDAD ({precio}€)</b>\n"
+                        f"🏠 {titulo}\n"
+                        f"🛏️ {habitaciones} hab | 📏 {metros}m² | 💰 {precio_m2}€/m²\n"
+                        f"<a href='{link}'>🔗 Ver en Idealista</a>"
+                    )
+                    enviar_telegram(msg, notification_type='new')
+                    
+                    log_event(logger, 'NEW_PROPERTY', {
+                        'id': pid,
+                        'titulo': titulo,
+                        'precio': precio,
+                        'habitaciones': habitaciones,
+                        'metros': metros
+                    })
+                    nuevos += 1
+                    
+                elif precio and precio < row[0]:
+                    # BAJADA DE PRECIO
+                    diff = row[0] - precio
+                    c.execute("UPDATE pisos SET precio=?, precio_m2=?, fecha_actualizacion=datetime('now') WHERE id=?", 
+                             (precio, precio_m2, pid))
+                    c.execute("INSERT INTO historial_precios VALUES (?, ?, datetime('now'))", (pid, precio))
+                    
+                    msg = (
+                        f"📉 <b>BAJADA DE PRECIO (-{diff}€)</b>\n"
+                        f"🏠 {titulo}\n"
+                        f"Antes: {row[0]}€ ➡️ {precio}€\n"
+                        f"<a href='{link}'>🔗 Ver piso</a>"
+                    )
+                    enviar_telegram(msg, notification_type='warning')
+                    
+                    log_event(logger, 'PRICE_DROP', {
+                        'id': pid,
+                        'titulo': titulo,
+                        'precio_anterior': row[0],
+                        'precio_nuevo': precio,
+                        'diferencia': diff
+                    })
+                    modificados += 1
+                
+                elif precio and precio > row[0]:
+                    # SUBIDA DE PRECIO (solo actualizar, sin notificación)
+                    c.execute("UPDATE pisos SET precio=?, fecha_actualizacion=datetime('now') WHERE id=?", 
+                             (precio, pid))
+                    c.execute("INSERT INTO historial_precios VALUES (?, ?, datetime('now'))", (pid, precio))
+                    modificados += 1
+                    
+            except Exception as e:
+                logger.warning(f"Error procesando piso {p.get('propertyCode')}: {e}")
+                estadisticas['errores'] += 1
+                continue
+        
+        conn.commit()
+        conn.close()
+        
+        if nuevos > 0 or modificados > 0:
+            logger.info(f"✨ Procesado: {nuevos} nuevos, {modificados} modificados")
+        
+    except Exception as e:
+        logger.error(f"Error procesando lote: {e}", exc_info=True)
+    
+    return nuevos, modificados
 
-    conn.commit()
-    conn.close()
-    if nuevos > 0: print(f"✨ {nuevos} pisos nuevos guardados.", flush=True)
+def backup_database():
+    """
+    Realiza backup de la base de datos SQLite
+    """
+    if not config.ENABLE_BACKUPS:
+        return
+    
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = config.BACKUP_DIR / f"pisos_backup_{timestamp}.db"
+        
+        shutil.copy2(str(config.DB_PATH), str(backup_path))
+        logger.info(f"Backup realizado: {backup_path}")
+        
+        # Limpiar backups antiguos (mantener últimos 7 días)
+        for backup_file in sorted(config.BACKUP_DIR.glob("pisos_backup_*.db"))[:-7]:
+            backup_file.unlink()
+            logger.debug(f"Backup antiguo eliminado: {backup_file}")
+        
+    except Exception as e:
+        logger.error(f"Error realizando backup: {e}", exc_info=True)
+
+
+def registrar_ejecucion(estadisticas: Dict, fecha_fin: datetime):
+    """
+    Registra la ejecución en BD para monitoreo
+    """
+    try:
+        conn = sqlite3.connect(str(config.DB_PATH))
+        c = conn.cursor()
+        
+        c.execute("""INSERT INTO ejecuciones 
+                     (fecha_fin, pisos_procesados, pisos_nuevos, pisos_modificados, errores, status)
+                     VALUES (datetime('now'), ?, ?, ?, ?, ?)""",
+                  (estadisticas['total_procesados'],
+                   estadisticas['totales_nuevos'],
+                   estadisticas['totales_modificados'],
+                   estadisticas['errores'],
+                   estadisticas['status']))
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Error registrando ejecución: {e}", exc_info=True)
+
+
+def health_check() -> bool:
+    """
+    Verifica que todo esté funcionando correctamente
+    """
+    try:
+        # Verificar BD
+        if not config.DB_PATH.exists():
+            logger.error("BD no existe")
+            return False
+        
+        conn = sqlite3.connect(str(config.DB_PATH))
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM pisos")
+        conn.close()
+        
+        # Verificar credenciales
+        valid, msg = config.validate_config()
+        if not valid:
+            logger.error(f"Config inválida: {msg}")
+            return False
+        
+        logger.info("✅ Health check OK")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Health check FAILED: {e}", exc_info=True)
+        return False
+
 
 if __name__ == "__main__":
-    init_db()
-    while True:
-        buscar_pisos()
-        print("💤 Durmiendo 24 horas...", flush=True)
-        time.sleep(86400)
+    try:
+        # Verificar configuración
+        valid_config, config_error = config.validate_config()
+        if not valid_config:
+            logger.error(f"Configuración inválida: {config_error}")
+            exit(1)
+        
+        # Inicializar BD
+        init_db()
+        
+        # Health check inicial
+        if not health_check():
+            logger.error("Health check fallido al iniciar")
+            exit(1)
+        
+        logger.info("🚀 Bot iniciado correctamente")
+        
+        # Loop principal
+        contador_ciclos = 0
+        while True:
+            contador_ciclos += 1
+            logger.info(f"\n--- CICLO {contador_ciclos} ---")
+            
+            try:
+                # Buscar pisos
+                estadisticas = buscar_pisos()
+                
+                # Realizar backup
+                backup_database()
+                
+                # Registrar ejecución
+                registrar_ejecucion(estadisticas, datetime.now())
+                
+                # Resumen
+                logger.info(
+                    f"📊 Resumen del ciclo: "
+                    f"Nuevos={estadisticas['totales_nuevos']}, "
+                    f"Modificados={estadisticas['totales_modificados']}, "
+                    f"Errores={estadisticas['errores']}"
+                )
+                
+                # Enviar notificación de resumen cada 24h
+                if contador_ciclos % 1 == 0 and config.ENABLE_TELEGRAM:
+                    msg_resumen = (
+                        f"📊 <b>Resumen de Búsqueda</b>\n"
+                        f"✨ Nuevos: {estadisticas['totales_nuevos']}\n"
+                        f"📝 Modificados: {estadisticas['totales_modificados']}\n"
+                        f"❌ Errores: {estadisticas['errores']}"
+                    )
+                    enviar_telegram(msg_resumen, notification_type='info')
+                
+            except Exception as e:
+                logger.error(f"Error en ciclo {contador_ciclos}: {e}", exc_info=True)
+                if config.ENABLE_TELEGRAM:
+                    enviar_telegram(f"❌ Error en búsqueda: {str(e)}", notification_type='error')
+            
+            # Esperar hasta próximo ciclo
+            logger.info(f"💤 Esperando {config.LOOP_INTERVAL}s hasta próximo ciclo...")
+            time.sleep(config.LOOP_INTERVAL)
+            
+    except KeyboardInterrupt:
+        logger.info("⏹️ Bot detenido por usuario")
+        exit(0)
+    except Exception as e:
+        logger.critical(f"Error crítico no recuperable: {e}", exc_info=True)
+        exit(1)
