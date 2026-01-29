@@ -1,20 +1,6 @@
 version: '3.8'
 
 services:
-  # --- RASTREADOR DE VUELOS ---
-  bot_vuelos:
-    build: ./vuelos
-    container_name: intel_vuelos
-    restart: unless-stopped
-    environment:
-     - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - AMADEUS_CLIENT_ID=${AMADEUS_CLIENT_ID}     
-      - AMADEUS_CLIENT_SECRET=${AMADEUS_CLIENT_SECRET}
-      - TZ=${TZ:-Europe/Madrid}
-    labels:
-      - "monitoring=enabled"
-
   # --- RASTREADOR DE IDEALISTA ---
   bot_idealista:
     build: ./idealista
