@@ -1,0 +1,246 @@
+```
+╔═══════════════════════════════════════════════════════════════════════╗
+║                                                                       ║
+║   ⭐ UPGRADE: CONTROL DE QUOTA API (100 PETICIONES/MES)              ║
+║                                                                       ║
+║   El código ha sido optimizado para economizar peticiones             ║
+║   Búsquedas: cada 24h → cada 72h (pero más eficientes)             ║
+║   Peticiones/mes: 150+ → 50 (margen de seguridad)                   ║
+║                                                                       ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 CAMBIOS PRINCIPALES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. ✅ Tracking automático de peticiones API
+   └─ Cada búsqueda se registra en BD
+   └─ Quota se actualiza en tiempo real
+
+2. ✅ Búsquedas espaciadas inteligentemente
+   └─ 72 horas entre búsquedas (ajustable)
+   └─ ~10-20 búsquedas/mes en lugar de 30
+
+3. ✅ Alertas automáticas en Telegram
+   └─ Status de quota en cada búsqueda
+   └─ Advertencia al 80%
+   └─ Crítica al 100%
+
+4. ✅ Pausa automática si se alcanza límite
+   └─ Evita sobrepasar 100/100 peticiones
+   └─ Reanuda en el próximo mes
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 PASOS PARA IMPLEMENTAR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PASO 1: Actualizar archivos
+────────────────────────────
+✓ config.py       → versión con QUOTA (ya actualizado)
+✓ main.py         → versión con tracking (REVISAR: main_v2_quota.py)
+✓ .env            → nuevas variables
+
+PASO 2: Actualizar .env
+─────────────────────────
+cp .env.example.new .env
+# O editar manualmente:
+SEARCH_INTERVAL_HOURS=72       # (DEFAULT: 3 días)
+MONTHLY_REQUEST_LIMIT=100      # (NO CAMBIAR)
+QUOTA_WARNING_THRESHOLD=0.8    # (DEFAULT: 80%)
+PAUSE_AT_QUOTA=true            # (DEFAULT: SÍ)
+
+PASO 3: Deploy
+───────────────
+./deploy.sh
+
+PASO 4: Monitorear
+───────────────────
+docker logs -f intel_idealista
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 CAMBIO DE COMPORTAMIENTO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ANTES (v1.0):
+─────────────
+Búsquedas:            cada 24h
+Búsquedas/mes:        30
+Peticiones/mes:       150+ ❌ EXCEDE
+Resultado:            API BLOQUEADA
+
+AHORA (v2.0):
+─────────────
+Búsquedas:            cada 72h (3 días)
+Búsquedas/mes:        10
+Peticiones/mes:       ~50 ✅ SEGURO
+Resultado:            SOSTENIBLE
+
+
+Equivalencia de frecuencia:
+┌─────────────────────┬───────────────┬──────────────┬────────────────┐
+│ Intervalo           │ Búsquedas/mes │ Requests/mes │ Sostenible     │
+├─────────────────────┼───────────────┼──────────────┼────────────────┤
+│ 48h (2 días)        │ 15            │ ~75          │ ✅ SÍ          │
+│ 72h (3 días)        │ 10            │ ~50          │ ✅ SÍ (DEFAULT) │
+│ 96h (4 días)        │ 8             │ ~40          │ ✅ MUY SEGURO  │
+│ 120h (5 días)       │ 6             │ ~30          │ ✅ CONSERVADOR │
+│ 168h (1 semana)     │ 4             │ ~20          │ ✅ MUY CONSERV │
+│ 24h (ORIGINAL)      │ 30            │ ~150         │ ❌ NO (EXCEDE) │
+└─────────────────────┴───────────────┴──────────────┴────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚙️ CONFIGURACIÓN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Variables en .env:
+──────────────────
+
+# CRÍTICO: No cambiar (es límite del API)
+MONTHLY_REQUEST_LIMIT=100
+
+# Ajustable: Intervalos entre búsquedas
+SEARCH_INTERVAL_HOURS=72            # DEFAULT: cada 3 días
+
+# Ajustable: Alertas
+QUOTA_WARNING_THRESHOLD=0.8         # DEFAULT: alerta al 80%
+PAUSE_AT_QUOTA=true                 # DEFAULT: pausar si alcanza 100%
+
+# Opcional: Reducir volumen de búsqueda
+MAX_PAGES_PER_DAY=5                 # DEFAULT: 5 páginas
+                                     # ALTERNATIVA: 3 páginas para economizar más
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💾 MONITOREO EN TIEMPO REAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Ver estado actual de quota:
+───────────────────────────
+$ source utils.sh
+$ query_db "SELECT mes_ano, usado, limite, \
+    ROUND(100.0*usado/limite,1) as porcentaje FROM api_quota"
+
+Ver últimas peticiones:
+────────────────────────
+$ query_db "SELECT fecha, tipo, exitoso FROM api_requests \
+    ORDER BY fecha DESC LIMIT 10"
+
+En Metabase (http://localhost:3000):
+──────────────────────────────────────
+Query:
+SELECT 
+    mes_ano,
+    usado,
+    limite,
+    ROUND((usado::float/limite)*100,1) as porcentaje,
+    (limite - usado) as disponibles
+FROM api_quota
+ORDER BY mes_ano DESC
+
+
+Logs en tiempo real:
+────────────────────
+$ docker logs -f intel_idealista | grep -i "quota\|api_request"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 ESCENARIOS DE USO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ESCENARIO 1: Máximo margen de seguridad (RECOMENDADO)
+──────────────────────────────────────────────────────
+SEARCH_INTERVAL_HOURS=120
+MAX_PAGES_PER_DAY=3
+
+Resultado:
+  • 6 búsquedas/mes
+  • ~30 requests/mes
+  • 70% de margen disponible
+  • MÁS CONFIABLE ✅
+
+
+ESCENARIO 2: Equilibrio (DEFAULT)
+──────────────────────────────────
+SEARCH_INTERVAL_HOURS=72
+MAX_PAGES_PER_DAY=5
+
+Resultado:
+  • 10 búsquedas/mes
+  • ~50 requests/mes
+  • 50% de margen disponible
+  • BALANCE ✅
+
+
+ESCENARIO 3: Máximo alcance (CON RIESGO)
+─────────────────────────────────────────
+SEARCH_INTERVAL_HOURS=48
+MAX_PAGES_PER_DAY=5
+
+Resultado:
+  • 15 búsquedas/mes
+  • ~75 requests/mes
+  • 25% de margen disponible
+  • ⚠️ MÁS RIESGO (reintentos, token requests)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 DOCUMENTACIÓN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Lee los siguientes archivos en orden:
+
+1. API_QUOTA.md
+   ├─ Entendimiento completo del sistema de quota
+   ├─ Fórmulas y matemáticas
+   ├─ Ejemplos de monitoreo
+   └─ Recomendaciones detalladas
+
+2. QUOTA_CHANGES_SUMMARY.md
+   ├─ Resumen de cambios implementados
+   ├─ Archivos modificados
+   ├─ Ejemplos de configuración
+   └─ Próximos pasos
+
+3. .env.example.new
+   ├─ Plantilla con todas las variables
+   ├─ Comentarios explicativos
+   └─ Valores recomendados
+
+4. config.py
+   ├─ Variables de quota en código
+   ├─ Valores por defecto
+   └─ Validaciones
+
+5. main.py (líneas ~150-350)
+   ├─ Funciones: check_api_quota()
+   ├─ Funciones: should_search_now()
+   ├─ Funciones: track_api_request()
+   └─ Lógica de control
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ ADVERTENCIAS IMPORTANTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ NO HAGAS:
+  • Cambiar MONTHLY_REQUEST_LIMIT (es el límite real del API)
+  • Reducir SEARCH_INTERVAL_HOURS a menos de 24h sin entender riesgos
+  • Ignorar alertas de quota al 80%
+  • Continuar buscando si PAUSE_AT_QUOTA=true y quota=100%
+
+✅ HAZLO:
+  • Leer API_QUOTA.md completamente
+  • Monitorear quota en primeras semanas
+  • Mantener PAUSE_AT_QUOTA=true
+  • Ajustar según necesidades después de datos reales
+  • Documentar cambios que hagas
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎉 RESULTADO FINAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ API SOSTENIBLE: Nunca excederá 100 peticiones/mes
+✅ AUTO-CONTROL: Se pausa automáticamente si alcanza límite
+✅ ALERTAS: Te avisa antes de problemas
+✅ MONITOREO: Tracking completo en BD y Metabase
+✅ FLEXIBLE: Ajustable según tus necesidades
+
+Tu bot ahora es ENTERPRISE-READY para producción 🚀
+```

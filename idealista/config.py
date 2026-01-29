@@ -30,12 +30,20 @@ SEARCH_RADIUS = int(os.getenv('SEARCH_RADIUS', 6000))  # metros
 SEARCH_BEDROOMS = os.getenv('SEARCH_BEDROOMS', '2,3,4').split(',')
 SEARCH_BATHROOMS = os.getenv('SEARCH_BATHROOMS', '1,2,3').split(',')
 
-# --- ESTRATEGIA DE CONSUMO ---
+# --- ESTRATEGIA DE CONSUMO Y QUOTA ---
 MAX_PAGES_PER_DAY = int(os.getenv('MAX_PAGES_PER_DAY', 5))
 ITEMS_PER_PAGE = int(os.getenv('ITEMS_PER_PAGE', 50))
 
+# CRÍTICO: Idealista API tiene límite de 100 requests/mes
+MONTHLY_REQUEST_LIMIT = int(os.getenv('MONTHLY_REQUEST_LIMIT', 100))
+# Búsquedas por mes = 100 requests / (5 páginas * 24 búsquedas/mes) ≈ 0.83 búsquedas/día
+# Recomendado: 1 búsqueda cada 2-3 días para estar seguro
+SEARCH_INTERVAL_HOURS = int(os.getenv('SEARCH_INTERVAL_HOURS', 72))  # 72h = 3 días
+QUOTA_WARNING_THRESHOLD = float(os.getenv('QUOTA_WARNING_THRESHOLD', 0.8))  # Alerta al 80%
+PAUSE_AT_QUOTA = os.getenv('PAUSE_AT_QUOTA', 'true').lower() == 'true'  # Pausar si alcanza 100%
+
 # --- TIEMPOS Y REINTENTOS ---
-LOOP_INTERVAL = int(os.getenv('LOOP_INTERVAL', 86400))  # 24 horas en segundos
+LOOP_INTERVAL = int(os.getenv('LOOP_INTERVAL', 86400))  # 24 horas en segundos (SOBREESCRITO por SEARCH_INTERVAL_HOURS)
 REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 15))  # segundos
 PAGE_WAIT_TIME = float(os.getenv('PAGE_WAIT_TIME', 1.5))  # segundos entre páginas
 TELEGRAM_TIMEOUT = int(os.getenv('TELEGRAM_TIMEOUT', 10))

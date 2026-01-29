@@ -1,6 +1,7 @@
 """
-Bot de rastreo de pisos en Idealista
+Bot de rastreo de pisos en Idealista - CON CONTROL DE QUOTA API
 Desplegado en Docker + SQLite + Metabase
+⭐ CRÍTICO: API limitado a 100 peticiones/mes
 """
 import requests
 import base64
@@ -25,187 +26,9 @@ logger = setup_logging(
 )
 
 
-def retry_on_exception(max_retries: int = config.MAX_RETRIES, 
-                       delay: int = config.RETRY_DELAY):
-    """Decorador para reintentar funciones que fallen"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise
-                    logger.warning(
-                        f"Intento {attempt + 1}/{max_retries} falló en {func.__name__}: {e}. "
-                        f"Reintentando en {delay}s..."
-                    )
-                    time.sleep(delay)
-        return wrapper
-    return decorator
-
-
-def init_db():
-    """
-    Inicializa la base de datos SQLite con todas las tablas necesarias
-    """
-    try:
-        logger.info("Inicializando base de datos...")
-        conn = sqlite3.connect(str(config.DB_PATH))
-        c = conn.cursor()
-        
-        # Tabla principal de pisos
-        c.execute('''CREATE TABLE IF NOT EXISTS pisos (
-            id TEXT PRIMARY KEY,
-            titulo TEXT NOT NULL,
-            precio REAL,
-            precio_m2 REAL,
-            metros INTEGER,
-            habitaciones INTEGER,
-            planta TEXT,
-            exterior BOOLEAN,
-            estado TEXT,
-            link TEXT NOT NULL,
-            fecha_registro DATETIME DEFAULT CURRENT_TIMESTAMP,
-            fecha_actualizacion DATETIME DEFAULT CURRENT_TIMESTAMP
-        )''')
-        
-        # Tabla de historial de precios para análisis temporal
-        c.execute('''CREATE TABLE IF NOT EXISTS historial_precios (
-            id_piso TEXT,
-            precio REAL,
-            fecha DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (id_piso) REFERENCES pisos(id)
-        )''')
-        
-        # Crear índices para mejor performance
-        c.execute('CREATE INDEX IF NOT EXISTS idx_pisos_precio ON pisos(precio)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_pisos_fecha ON pisos(fecha_actualizacion)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_historial_piso ON historial_precios(id_piso)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_historial_fecha ON historial_precios(fecha)')
-        
-        # Tabla de estadísticas de ejecución (para monitoreo)
-        c.execute('''CREATE TABLE IF NOT EXISTS ejecuciones (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fecha_inicio DATETIME DEFAULT CURRENT_TIMESTAMP,
-            fecha_fin DATETIME,
-            pisos_procesados INTEGER,
-            pisos_nuevos INTEGER,
-            pisos_modificados INTEGER,
-            errores INTEGER,
-            status TEXT
-        )''')
-        
-        # ⭐ NUEVA TABLA: Tracking de peticiones API (CRÍTICO para quota)
-        c.execute('''CREATE TABLE IF NOT EXISTS api_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fecha DATETIME DEFAULT CURRENT_TIMESTAMP,
-            endpoint TEXT,
-            tipo TEXT,
-            exitoso BOOLEAN,
-            mes_ano TEXT,
-            FOREIGN KEY (mes_ano) REFERENCES api_quota(mes_ano)
-        )''')
-        
-        # ⭐ NUEVA TABLA: Quota de API por mes
-        c.execute('''CREATE TABLE IF NOT EXISTS api_quota (
-            mes_ano TEXT PRIMARY KEY,
-            limite INTEGER DEFAULT 100,
-            usado INTEGER DEFAULT 0,
-            fecha_inicio DATETIME,
-            fecha_fin DATETIME
-        )''')
-        
-        # Crear índices para API tracking
-        c.execute('CREATE INDEX IF NOT EXISTS idx_api_requests_fecha ON api_requests(fecha)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_api_requests_mes ON api_requests(mes_ano)')
-        
-        conn.commit()
-        conn.close()
-        logger.info("Base de datos inicializada correctamente")
-        
-    except Exception as e:
-        logger.error(f"Error inicializando BD: {e}", exc_info=True)
-        raise
-
-@retry_on_exception(max_retries=config.MAX_RETRIES, delay=config.RETRY_DELAY)
-def enviar_telegram(msg: str, notification_type: str = 'info'):
-    """
-    Envía mensaje a Telegram con reintentos automáticos
-    
-    Args:
-        msg: Mensaje a enviar
-        notification_type: Tipo de notificación (info, warning, error)
-    """
-    if not config.ENABLE_TELEGRAM:
-        logger.debug("Telegram deshabilitado, skip")
-        return
-    
-    try:
-        url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            'chat_id': config.TELEGRAM_CHAT_ID,
-            'text': msg,
-            'parse_mode': 'HTML'
-        }
-        
-        response = requests.post(url, data=payload, timeout=config.TELEGRAM_TIMEOUT)
-        response.raise_for_status()
-        
-        log_event(logger, 'TELEGRAM_SENT', {
-            'notification_type': notification_type,
-            'length': len(msg)
-        })
-        
-    except Exception as e:
-        log_event(logger, 'TELEGRAM_ERROR', {
-            'error': str(e),
-            'message_preview': msg[:100]
-        }, level='error')
-
-@retry_on_exception(max_retries=config.MAX_RETRIES, delay=config.RETRY_DELAY)
-def obtener_token() -> Optional[str]:
-    """
-    Obtiene token OAuth de Idealista con reintentos automáticos
-    
-    Returns:
-        Token de acceso o None si falla
-    """
-    try:
-        # Codificar credenciales en Base64
-        credenciales = f"{config.IDEALISTA_API_KEY}:{config.IDEALISTA_SECRET}"
-        auth_b64 = base64.b64encode(credenciales.encode()).decode()
-        
-        headers = {
-            "Authorization": f"Basic {auth_b64}",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        
-        logger.debug("Solicitando token OAuth...")
-        response = requests.post(
-            config.IDEALISTA_TOKEN_URL,
-            headers=headers,
-            data={"grant_type": "client_credentials", "scope": "read"},
-            timeout=config.REQUEST_TIMEOUT
-        )
-        
-        if response.status_code == 200:
-            token = response.json().get('access_token')
-            logger.debug("Token obtenido correctamente")
-            return token
-        
-        logger.error(f"Error obteniendo token ({response.status_code}): {response.text}")
-        return None
-        
-    except Exception as e:
-        log_event(logger, 'TOKEN_ERROR', {'error': str(e)}, level='error')
-        raise
-
-
 def track_api_request(exitoso: bool = True, tipo: str = 'search'):
     """
-    Registra una petición API en la BD para tracking de quota
+    ⭐ CRÍTICO: Registra una petición API en la BD para tracking de quota
     
     Args:
         exitoso: Si la petición fue exitosa
@@ -248,7 +71,7 @@ def track_api_request(exitoso: bool = True, tipo: str = 'search'):
 
 def check_api_quota() -> Tuple[bool, int, int]:
     """
-    Verifica la quota disponible de API
+    ⭐ CRÍTICO: Verifica la quota disponible de API (100 peticiones/mes)
     
     Returns:
         (puede_continuar, usado, limite)
@@ -287,9 +110,9 @@ def check_api_quota() -> Tuple[bool, int, int]:
 
 def should_search_now() -> bool:
     """
-    Determina si se debe hacer búsqueda ahora considerando:
+    ⭐ CRÍTICO: Determina si se debe hacer búsqueda ahora considerando:
     1. Quota disponible
-    2. Última búsqueda
+    2. Última búsqueda (espaciadas para economizar quota)
     
     Returns:
         True si se debe buscar, False si no
@@ -317,7 +140,7 @@ def should_search_now() -> bool:
             
             if tiempo_desde < timedelta(hours=config.SEARCH_INTERVAL_HOURS):
                 horas_restantes = config.SEARCH_INTERVAL_HOURS - (tiempo_desde.total_seconds() / 3600)
-                logger.info(f"⏳ Próxima búsqueda en {horas_restantes:.1f} horas")
+                logger.info(f"⏳ Próxima búsqueda en {horas_restantes:.1f} horas (economizando quota)")
                 return False
         
         return True
@@ -328,7 +151,7 @@ def should_search_now() -> bool:
 
 
 def get_quota_status_message() -> str:
-    """Retorna mensaje de estado de quota para Telegram"""
+    """⭐ Retorna mensaje de estado de quota para Telegram"""
     puede, usado, limite = check_api_quota()
     porcentaje = (usado / limite) * 100
     
@@ -339,23 +162,201 @@ def get_quota_status_message() -> str:
     else:
         return f"✅ QUOTA OK\n{usado}/{limite} peticiones ({porcentaje:.0f}% usado)\nBúsquedas cada {config.SEARCH_INTERVAL_HOURS}h"
 
+
+def retry_on_exception(max_retries: int = config.MAX_RETRIES, 
+                       delay: int = config.RETRY_DELAY):
+    """Decorador para reintentar funciones que fallen"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    logger.warning(
+                        f"Intento {attempt + 1}/{max_retries} falló en {func.__name__}: {e}. "
+                        f"Reintentando en {delay}s..."
+                    )
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+
+
+def init_db():
+    """
+    Inicializa la base de datos SQLite con todas las tablas necesarias
+    ⭐ INCLUYE TABLAS DE TRACKING DE API QUOTA
+    """
+    try:
+        logger.info("Inicializando base de datos...")
+        conn = sqlite3.connect(str(config.DB_PATH))
+        c = conn.cursor()
+        
+        # Tabla principal de pisos
+        c.execute('''CREATE TABLE IF NOT EXISTS pisos (
+            id TEXT PRIMARY KEY,
+            titulo TEXT NOT NULL,
+            precio REAL,
+            precio_m2 REAL,
+            metros INTEGER,
+            habitaciones INTEGER,
+            planta TEXT,
+            exterior BOOLEAN,
+            estado TEXT,
+            link TEXT NOT NULL,
+            fecha_registro DATETIME DEFAULT CURRENT_TIMESTAMP,
+            fecha_actualizacion DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # Tabla de historial de precios
+        c.execute('''CREATE TABLE IF NOT EXISTS historial_precios (
+            id_piso TEXT,
+            precio REAL,
+            fecha DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (id_piso) REFERENCES pisos(id)
+        )''')
+        
+        # Crear índices para performance
+        c.execute('CREATE INDEX IF NOT EXISTS idx_pisos_precio ON pisos(precio)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_pisos_fecha ON pisos(fecha_actualizacion)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_historial_piso ON historial_precios(id_piso)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_historial_fecha ON historial_precios(fecha)')
+        
+        # Tabla de estadísticas de ejecución
+        c.execute('''CREATE TABLE IF NOT EXISTS ejecuciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_inicio DATETIME DEFAULT CURRENT_TIMESTAMP,
+            fecha_fin DATETIME,
+            pisos_procesados INTEGER,
+            pisos_nuevos INTEGER,
+            pisos_modificados INTEGER,
+            errores INTEGER,
+            status TEXT
+        )''')
+        
+        # ⭐ NUEVA TABLA: Tracking de peticiones API (CRÍTICO)
+        c.execute('''CREATE TABLE IF NOT EXISTS api_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha DATETIME DEFAULT CURRENT_TIMESTAMP,
+            endpoint TEXT,
+            tipo TEXT,
+            exitoso BOOLEAN,
+            mes_ano TEXT,
+            FOREIGN KEY (mes_ano) REFERENCES api_quota(mes_ano)
+        )''')
+        
+        # ⭐ NUEVA TABLA: Quota de API por mes (CRÍTICO: 100 requests/mes)
+        c.execute('''CREATE TABLE IF NOT EXISTS api_quota (
+            mes_ano TEXT PRIMARY KEY,
+            limite INTEGER DEFAULT 100,
+            usado INTEGER DEFAULT 0,
+            fecha_inicio DATETIME,
+            fecha_fin DATETIME
+        )''')
+        
+        # Crear índices
+        c.execute('CREATE INDEX IF NOT EXISTS idx_api_requests_fecha ON api_requests(fecha)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_api_requests_mes ON api_requests(mes_ano)')
+        
+        conn.commit()
+        conn.close()
+        logger.info("✅ Base de datos inicializada correctamente (CON QUOTA TRACKING)")
+        
+    except Exception as e:
+        logger.error(f"Error inicializando BD: {e}", exc_info=True)
+        raise
+
+
+@retry_on_exception(max_retries=config.MAX_RETRIES, delay=config.RETRY_DELAY)
+def enviar_telegram(msg: str, notification_type: str = 'info'):
+    """Envía mensaje a Telegram con reintentos automáticos"""
+    if not config.ENABLE_TELEGRAM:
+        logger.debug("Telegram deshabilitado, skip")
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': config.TELEGRAM_CHAT_ID,
+            'text': msg,
+            'parse_mode': 'HTML'
+        }
+        
+        response = requests.post(url, data=payload, timeout=config.TELEGRAM_TIMEOUT)
+        response.raise_for_status()
+        
+        log_event(logger, 'TELEGRAM_SENT', {
+            'notification_type': notification_type,
+            'length': len(msg)
+        })
+        
+    except Exception as e:
+        log_event(logger, 'TELEGRAM_ERROR', {
+            'error': str(e),
+            'message_preview': msg[:100]
+        }, level='error')
+
+
 @retry_on_exception(max_retries=config.MAX_RETRIES, delay=config.RETRY_DELAY)
 def obtener_token() -> Optional[str]:
+    """Obtiene token OAuth de Idealista - ⭐ REGISTRA PETICIÓN API"""
+    try:
+        credenciales = f"{config.IDEALISTA_API_KEY}:{config.IDEALISTA_SECRET}"
+        auth_b64 = base64.b64encode(credenciales.encode()).decode()
+        
+        headers = {
+            "Authorization": f"Basic {auth_b64}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        logger.debug("Solicitando token OAuth...")
+        response = requests.post(
+            config.IDEALISTA_TOKEN_URL,
+            headers=headers,
+            data={"grant_type": "client_credentials", "scope": "read"},
+            timeout=config.REQUEST_TIMEOUT
+        )
+        
+        # ⭐ REGISTRAR PETICIÓN API
+        track_api_request(exitoso=(response.status_code == 200), tipo='token')
+        
+        if response.status_code == 200:
+            token = response.json().get('access_token')
+            logger.debug("Token obtenido correctamente")
+            return token
+        
+        logger.error(f"Error obteniendo token ({response.status_code}): {response.text}")
+        return None
+        
+    except Exception as e:
+        log_event(logger, 'TOKEN_ERROR', {'error': str(e)}, level='error')
+        raise
+
+
+def buscar_pisos() -> Dict:
     """
-    Busca pisos en Idealista y procesa los resultados
-    
-    Returns:
-        Diccionario con estadísticas de la búsqueda
+    ⭐ CRÍTICO: Busca pisos en Idealista con control de quota
+    - Verifica quota antes de buscar
+    - Registra cada petición
+    - Pausa automáticamente si se alcanza límite
     """
     estadisticas = {
         'total_procesados': 0,
         'totales_nuevos': 0,
         'totales_modificados': 0,
         'errores': 0,
-        'status': 'success'
+        'status': 'success',
+        'quota_alcanzada': False
     }
     
     try:
+        # ⭐ VERIFICAR QUOTA PRIMERO
+        if not should_search_now():
+            logger.info("Búsqueda saltada: próxima búsqueda no es ahora")
+            return estadisticas
+        
         logger.info("=== INICIANDO BÚSQUEDA DE PISOS ===")
         
         token = obtener_token()
@@ -391,6 +392,16 @@ def obtener_token() -> Optional[str]:
                     timeout=config.REQUEST_TIMEOUT
                 )
                 
+                # ⭐ REGISTRAR PETICIÓN API
+                track_api_request(exitoso=(response.status_code == 200), tipo='search')
+                
+                # ⭐ VERIFICAR QUOTA DESPUÉS DE CADA PETICIÓN
+                puede, usado, limite = check_api_quota()
+                if not puede:
+                    logger.critical(f"❌ QUOTA AGOTADA ({usado}/{limite})")
+                    estadisticas['quota_alcanzada'] = True
+                    break
+                
                 if response.status_code != 200:
                     logger.error(f"Error API ({response.status_code}): {response.text}")
                     estadisticas['errores'] += 1
@@ -401,10 +412,7 @@ def obtener_token() -> Optional[str]:
                 total_disponible = data.get('total', 0)
                 total_paginas = data.get('totalPages', 1)
                 
-                logger.info(
-                    f"Página {num_pagina}: {len(pisos)} pisos recibidos "
-                    f"(Total mercado: {total_disponible})"
-                )
+                logger.info(f"Página {num_pagina}: {len(pisos)} pisos (Total: {total_disponible})")
                 
                 if not pisos:
                     logger.info("No hay más pisos disponibles")
@@ -432,22 +440,20 @@ def obtener_token() -> Optional[str]:
             f"Modificados: {estadisticas['totales_modificados']}"
         )
         
+        # ⭐ MOSTRAR STATUS DE QUOTA AL FINAL
+        puede, usado, limite = check_api_quota()
+        if puede:
+            enviar_telegram(get_quota_status_message(), notification_type='info')
+        
     except Exception as e:
         logger.error(f"Error crítico en búsqueda: {e}", exc_info=True)
         estadisticas['status'] = 'error'
     
     return estadisticas
 
+
 def procesar_lote(pisos: List[Dict]) -> Tuple[int, int]:
-    """
-    Procesa un lote de pisos y los almacena en BD
-    
-    Args:
-        pisos: Lista de diccionarios con datos de pisos
-        
-    Returns:
-        Tupla (pisos_nuevos, pisos_modificados)
-    """
+    """Procesa un lote de pisos y los almacena en BD"""
     nuevos = 0
     modificados = 0
     
@@ -466,7 +472,6 @@ def procesar_lote(pisos: List[Dict]) -> Tuple[int, int]:
                 exterior = p.get('exterior', False)
                 link = p.get('url', '')
                 
-                # Cálculo de precio m2
                 precio_m2 = p.get('priceByArea')
                 if not precio_m2 and metros and precio:
                     precio_m2 = round(precio / metros, 1)
@@ -475,7 +480,6 @@ def procesar_lote(pisos: List[Dict]) -> Tuple[int, int]:
                 row = c.fetchone()
                 
                 if not row:
-                    # NUEVO PISO
                     c.execute("""INSERT INTO pisos 
                                  (id, titulo, precio, precio_m2, metros, habitaciones, 
                                   planta, exterior, link, fecha_registro, fecha_actualizacion) 
@@ -490,18 +494,9 @@ def procesar_lote(pisos: List[Dict]) -> Tuple[int, int]:
                         f"<a href='{link}'>🔗 Ver en Idealista</a>"
                     )
                     enviar_telegram(msg, notification_type='new')
-                    
-                    log_event(logger, 'NEW_PROPERTY', {
-                        'id': pid,
-                        'titulo': titulo,
-                        'precio': precio,
-                        'habitaciones': habitaciones,
-                        'metros': metros
-                    })
                     nuevos += 1
                     
                 elif precio and precio < row[0]:
-                    # BAJADA DE PRECIO
                     diff = row[0] - precio
                     c.execute("UPDATE pisos SET precio=?, precio_m2=?, fecha_actualizacion=datetime('now') WHERE id=?", 
                              (precio, precio_m2, pid))
@@ -514,18 +509,9 @@ def procesar_lote(pisos: List[Dict]) -> Tuple[int, int]:
                         f"<a href='{link}'>🔗 Ver piso</a>"
                     )
                     enviar_telegram(msg, notification_type='warning')
-                    
-                    log_event(logger, 'PRICE_DROP', {
-                        'id': pid,
-                        'titulo': titulo,
-                        'precio_anterior': row[0],
-                        'precio_nuevo': precio,
-                        'diferencia': diff
-                    })
                     modificados += 1
                 
                 elif precio and precio > row[0]:
-                    # SUBIDA DE PRECIO (solo actualizar, sin notificación)
                     c.execute("UPDATE pisos SET precio=?, fecha_actualizacion=datetime('now') WHERE id=?", 
                              (precio, pid))
                     c.execute("INSERT INTO historial_precios VALUES (?, ?, datetime('now'))", (pid, precio))
@@ -533,7 +519,6 @@ def procesar_lote(pisos: List[Dict]) -> Tuple[int, int]:
                     
             except Exception as e:
                 logger.warning(f"Error procesando piso {p.get('propertyCode')}: {e}")
-                estadisticas['errores'] += 1
                 continue
         
         conn.commit()
@@ -547,10 +532,9 @@ def procesar_lote(pisos: List[Dict]) -> Tuple[int, int]:
     
     return nuevos, modificados
 
+
 def backup_database():
-    """
-    Realiza backup de la base de datos SQLite
-    """
+    """Realiza backup de la base de datos SQLite"""
     if not config.ENABLE_BACKUPS:
         return
     
@@ -561,7 +545,6 @@ def backup_database():
         shutil.copy2(str(config.DB_PATH), str(backup_path))
         logger.info(f"Backup realizado: {backup_path}")
         
-        # Limpiar backups antiguos (mantener últimos 7 días)
         for backup_file in sorted(config.BACKUP_DIR.glob("pisos_backup_*.db"))[:-7]:
             backup_file.unlink()
             logger.debug(f"Backup antiguo eliminado: {backup_file}")
@@ -570,10 +553,8 @@ def backup_database():
         logger.error(f"Error realizando backup: {e}", exc_info=True)
 
 
-def registrar_ejecucion(estadisticas: Dict, fecha_fin: datetime):
-    """
-    Registra la ejecución en BD para monitoreo
-    """
+def registrar_ejecucion(estadisticas: Dict):
+    """Registra la ejecución en BD para monitoreo"""
     try:
         conn = sqlite3.connect(str(config.DB_PATH))
         c = conn.cursor()
@@ -595,21 +576,18 @@ def registrar_ejecucion(estadisticas: Dict, fecha_fin: datetime):
 
 
 def health_check() -> bool:
-    """
-    Verifica que todo esté funcionando correctamente
-    """
+    """Verifica que todo esté funcionando correctamente"""
     try:
-        # Verificar BD
         if not config.DB_PATH.exists():
             logger.error("BD no existe")
             return False
         
         conn = sqlite3.connect(str(config.DB_PATH))
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM pisos")
+        c.execute("SELECT 1 FROM pisos LIMIT 1")
+        c.execute("SELECT 1 FROM api_quota LIMIT 1")
         conn.close()
         
-        # Verificar credenciales
         valid, msg = config.validate_config()
         if not valid:
             logger.error(f"Config inválida: {msg}")
@@ -625,64 +603,49 @@ def health_check() -> bool:
 
 if __name__ == "__main__":
     try:
-        # Verificar configuración
         valid_config, config_error = config.validate_config()
         if not valid_config:
             logger.error(f"Configuración inválida: {config_error}")
             exit(1)
         
-        # Inicializar BD
         init_db()
         
-        # Health check inicial
         if not health_check():
             logger.error("Health check fallido al iniciar")
             exit(1)
         
-        logger.info("🚀 Bot iniciado correctamente")
+        logger.info("🚀 Bot iniciado correctamente (CON CONTROL DE QUOTA)")
+        logger.info(f"⭐ Límite API: {config.MONTHLY_REQUEST_LIMIT} peticiones/mes")
+        logger.info(f"⭐ Intervalo búsqueda: cada {config.SEARCH_INTERVAL_HOURS} horas")
         
-        # Loop principal
         contador_ciclos = 0
         while True:
             contador_ciclos += 1
             logger.info(f"\n--- CICLO {contador_ciclos} ---")
             
             try:
-                # Buscar pisos
                 estadisticas = buscar_pisos()
-                
-                # Realizar backup
                 backup_database()
+                registrar_ejecucion(estadisticas)
                 
-                # Registrar ejecución
-                registrar_ejecucion(estadisticas, datetime.now())
-                
-                # Resumen
                 logger.info(
-                    f"📊 Resumen del ciclo: "
-                    f"Nuevos={estadisticas['totales_nuevos']}, "
+                    f"📊 Resumen: Nuevos={estadisticas['totales_nuevos']}, "
                     f"Modificados={estadisticas['totales_modificados']}, "
                     f"Errores={estadisticas['errores']}"
                 )
                 
-                # Enviar notificación de resumen cada 24h
-                if contador_ciclos % 1 == 0 and config.ENABLE_TELEGRAM:
-                    msg_resumen = (
-                        f"📊 <b>Resumen de Búsqueda</b>\n"
-                        f"✨ Nuevos: {estadisticas['totales_nuevos']}\n"
-                        f"📝 Modificados: {estadisticas['totales_modificados']}\n"
-                        f"❌ Errores: {estadisticas['errores']}"
-                    )
-                    enviar_telegram(msg_resumen, notification_type='info')
+                if estadisticas['quota_alcanzada']:
+                    logger.critical("⛔ BÚSQUEDAS PAUSADAS: QUOTA AGOTADA")
+                    enviar_telegram("🚨 QUOTA API AGOTADA\nPróximas búsquedas en el próximo mes", 
+                                  notification_type='error')
                 
             except Exception as e:
                 logger.error(f"Error en ciclo {contador_ciclos}: {e}", exc_info=True)
-                if config.ENABLE_TELEGRAM:
-                    enviar_telegram(f"❌ Error en búsqueda: {str(e)}", notification_type='error')
+                enviar_telegram(f"❌ Error en búsqueda: {str(e)}", notification_type='error')
             
-            # Esperar hasta próximo ciclo
-            logger.info(f"💤 Esperando {config.LOOP_INTERVAL}s hasta próximo ciclo...")
-            time.sleep(config.LOOP_INTERVAL)
+            # INTERVALO CONFIGURABLE (por defecto cada 3 días para economizar quota)
+            logger.info(f"💤 Esperando {config.SEARCH_INTERVAL_HOURS}h hasta próxima búsqueda...")
+            time.sleep(config.SEARCH_INTERVAL_HOURS * 3600)
             
     except KeyboardInterrupt:
         logger.info("⏹️ Bot detenido por usuario")
